@@ -12,6 +12,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <unordered_map>
 
 // Direct include - no more dynamic loading!
 #include "../lidar_odometry/src/processing/Estimator.h"
@@ -26,6 +27,21 @@ public:
         
         // Declare parameters
         this->declare_parameter("config_file", "");
+        this->declare_parameter("global_map_voxel_size", 0.3);  // 10cm voxel size for downsampling
+        this->declare_parameter("accumulate_every_n_frames", 15);  // Accumulate every N frames
+        
+        // Get parameters
+        global_map_voxel_size_ = this->get_parameter("global_map_voxel_size").as_double();
+        accumulate_every_n_frames_ = this->get_parameter("accumulate_every_n_frames").as_int();
+        
+        RCLCPP_INFO(this->get_logger(), "Global map voxel size: %.3f m", global_map_voxel_size_);
+        RCLCPP_INFO(this->get_logger(), "Accumulating every %d frames", accumulate_every_n_frames_);
+        
+        // Initialize global map
+        global_map_ = std::make_shared<lidar_odometry::util::PointCloud>();
+
+        // Initialize intensity map
+        //intensity_map_ = std::make_shared<std::unordered_map<lidar_odometry::util::Point3D*, float>>();
         
         // Load config
         load_config();
@@ -37,6 +53,7 @@ public:
         // Publishers - using lidar_odometry namespace
         odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("odometry", 10);
         map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("map_points", 10);
+        global_map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("global_map", 10);
         features_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("feature_points", 10);
         trajectory_pub_ = create_publisher<nav_msgs::msg::Path>("trajectory", 10);
         current_cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("current_cloud", 10);
@@ -66,20 +83,91 @@ public:
 
 private:
     /**
+     * @brief Voxel grid downsampling for point clouds
+     */
+    lidar_odometry::util::PointCloudPtr voxel_downsample(
+        const lidar_odometry::util::PointCloudPtr& cloud,
+        float voxel_size) {
+        
+        if (!cloud || cloud->empty() || voxel_size <= 0.0f) {
+            return cloud;
+        }
+        
+        // Hash function for voxel grid
+        auto voxel_hash = [voxel_size](float x, float y, float z) -> std::tuple<int, int, int> {
+            return std::make_tuple(
+                static_cast<int>(std::floor(x / voxel_size)),
+                static_cast<int>(std::floor(y / voxel_size)),
+                static_cast<int>(std::floor(z / voxel_size))
+            );
+        };
+        
+        // Use unordered_map to store voxel centroids
+        struct VoxelData {
+            float x_sum = 0.0f;
+            float y_sum = 0.0f;
+            float z_sum = 0.0f;
+            float i_sum = 0.0f;
+            int count = 0;
+        };
+        
+        // Custom hash for tuple
+        struct TupleHash {
+            std::size_t operator()(const std::tuple<int, int, int>& t) const {
+                auto h1 = std::hash<int>{}(std::get<0>(t));
+                auto h2 = std::hash<int>{}(std::get<1>(t));
+                auto h3 = std::hash<int>{}(std::get<2>(t));
+                return h1 ^ (h2 << 1) ^ (h3 << 2);
+            }
+        };
+        
+        std::unordered_map<std::tuple<int, int, int>, VoxelData, TupleHash> voxel_map;
+        
+        // Accumulate points in voxels
+        for (size_t i = 0; i < cloud->size(); ++i) {
+            const auto& point = (*cloud)[i];
+            const auto intensity = cloud->getIntensity(i);
+            auto voxel_key = voxel_hash(point.x, point.y, point.z);
+            
+            auto& voxel = voxel_map[voxel_key];
+            voxel.x_sum += point.x;
+            voxel.y_sum += point.y;
+            voxel.z_sum += point.z;
+            voxel.i_sum += intensity;
+            voxel.count++;
+        }
+        
+        // Create downsampled cloud with voxel centroids
+        auto downsampled = std::make_shared<lidar_odometry::util::PointCloud>();
+        downsampled->reserve(voxel_map.size());
+        for (const auto& [key, voxel] : voxel_map) {
+            downsampled->push_back(
+                voxel.x_sum / voxel.count,
+                voxel.y_sum / voxel.count,
+                voxel.z_sum / voxel.count,
+                voxel.i_sum / voxel.count
+            );
+        }
+        
+        return downsampled;
+    }
+    
+    /**
      * @brief Convert ROS PointCloud2 message to internal point cloud format
      */
     lidar_odometry::util::PointCloudPtr convert_ros_to_internal(const sensor_msgs::msg::PointCloud2::SharedPtr& ros_cloud) {
         auto internal_cloud = std::make_shared<lidar_odometry::util::PointCloud>();
         
         // Parse the PointCloud2 message fields
-        int x_offset = -1, y_offset = -1, z_offset = -1;
+        int x_offset = -1, y_offset = -1, z_offset = -1, i_offset = -1;
         for (const auto& field : ros_cloud->fields) {
             if (field.name == "x") x_offset = field.offset;
             else if (field.name == "y") y_offset = field.offset;
             else if (field.name == "z") z_offset = field.offset;
+            else if (field.name == "intensity") i_offset = field.offset;
         }
         
-        if (x_offset < 0 || y_offset < 0 || z_offset < 0) {
+        if (x_offset < 0 || y_offset < 0 || z_offset < 0 || i_offset < 0) {
             RCLCPP_ERROR(this->get_logger(), "Invalid PointCloud2 format: missing x, y, or z fields");
             return internal_cloud;
         }
@@ -91,14 +179,15 @@ private:
         for (size_t i = 0; i < ros_cloud->width * ros_cloud->height; ++i) {
             const uint8_t* point_data = data_ptr + i * ros_cloud->point_step;
             
-            float x, y, z;
+            float x, y, z, intensity;
             memcpy(&x, point_data + x_offset, sizeof(float));
             memcpy(&y, point_data + y_offset, sizeof(float));
             memcpy(&z, point_data + z_offset, sizeof(float));
+            memcpy(&intensity, point_data + i_offset, sizeof(float));
             
             // Filter out invalid points
-            if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z)) {
-                internal_cloud->push_back(x, y, z);
+            if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z) && std::isfinite(intensity)) {
+                internal_cloud->push_back(x, y, z, intensity);
             }
         }
         
@@ -128,8 +217,8 @@ private:
         cloud_msg.width = internal_cloud->size();
         cloud_msg.is_dense = true;
         
-        // Define fields for x, y, z coordinates
-        cloud_msg.fields.resize(3);
+        // Define fields for x, y, z, i coordinates
+        cloud_msg.fields.resize(4);
         
         cloud_msg.fields[0].name = "x";
         cloud_msg.fields[0].offset = 0;
@@ -145,8 +234,13 @@ private:
         cloud_msg.fields[2].offset = 8;
         cloud_msg.fields[2].datatype = sensor_msgs::msg::PointField::FLOAT32;
         cloud_msg.fields[2].count = 1;
+
+        cloud_msg.fields[3].name = "intensity";
+        cloud_msg.fields[3].offset = 12;
+        cloud_msg.fields[3].datatype = sensor_msgs::msg::PointField::FLOAT32;
+        cloud_msg.fields[3].count = 1;
         
-        cloud_msg.point_step = 12; // 3 * sizeof(float32)
+        cloud_msg.point_step = 16; // 4 * sizeof(float32)
         cloud_msg.row_step = cloud_msg.point_step * cloud_msg.width;
         
         // Allocate memory for the data
@@ -156,11 +250,13 @@ private:
         uint8_t* data_ptr = cloud_msg.data.data();
         for (size_t i = 0; i < internal_cloud->size(); ++i) {
             const auto& point = (*internal_cloud)[i];
+            const float intensity = internal_cloud->getIntensity(i);
             
-            // Copy x, y, z coordinates as float32
+            // Copy x, y, z, intensity coordinates as float32
             memcpy(data_ptr + i * cloud_msg.point_step + 0, &point.x, sizeof(float));
             memcpy(data_ptr + i * cloud_msg.point_step + 4, &point.y, sizeof(float));
             memcpy(data_ptr + i * cloud_msg.point_step + 8, &point.z, sizeof(float));
+            memcpy(data_ptr + i * cloud_msg.point_step + 12, &intensity, sizeof(float));
         }
         
         return cloud_msg;
@@ -267,12 +363,18 @@ private:
             // Get current pose
             const auto& pose = estimator_->get_current_pose();
             
+            // Accumulate points into global map
+            if (frame_count_ % accumulate_every_n_frames_ == 0) {
+                accumulate_to_global_map(internal_cloud, pose);
+            }
+            
             // Publish odometry
             publish_odometry(msg, pose);
             
             // Publish visualization data
             spdlog::debug("Publishing visualization data");
             publish_map_points(msg->header);
+            publish_global_map(msg->header);
             publish_current_cloud(msg);
             publish_features(msg->header);
             publish_trajectory(msg->header);
@@ -333,6 +435,56 @@ private:
         // Send both transforms at once
         std::vector<geometry_msgs::msg::TransformStamped> transforms = {map_to_odom_tf, odom_to_base_tf};
         tf_broadcaster_->sendTransform(transforms);
+    }
+    
+    void accumulate_to_global_map(
+        const lidar_odometry::util::PointCloudPtr& cloud,
+        const lidar_odometry::util::SE3f& pose) {
+        
+        std::lock_guard<std::mutex> lock(global_map_mutex_);
+        
+        // Transform points to global frame
+        Eigen::Matrix4f transform_matrix = pose.matrix().cast<float>();
+        
+        auto transformed_cloud = std::make_shared<lidar_odometry::util::PointCloud>();
+        transformed_cloud->reserve(cloud->size());
+        
+        for (size_t i = 0; i < cloud->size(); ++i) {
+            const auto& point = (*cloud)[i];
+            const auto intensity = cloud->getIntensity(i);
+            Eigen::Vector4f local_point(point.x, point.y, point.z, 1.0f);
+            Eigen::Vector4f global_point = transform_matrix * local_point;
+            
+            transformed_cloud->push_back(global_point.x(), global_point.y(), global_point.z(), intensity);
+        }
+        
+        // Add to global map
+        for (size_t i = 0; i < transformed_cloud->size(); ++i) {
+            const auto& point = (*transformed_cloud)[i];
+            const auto intensity = cloud->getIntensity(i);
+            global_map_->push_back(point.x, point.y, point.z, intensity);
+        }
+        
+        RCLCPP_INFO(this->get_logger(), "Accumulated %zu points. Global map size before downsampling: %zu", 
+                   transformed_cloud->size(), global_map_->size());
+        
+        // Apply voxel downsampling to global map
+        global_map_ = voxel_downsample(global_map_, /*intensity_map_,*/ global_map_voxel_size_);
+        
+        RCLCPP_INFO(this->get_logger(), "Global map size after downsampling: %zu", global_map_->size());
+    }
+   
+    void publish_global_map(const std_msgs::msg::Header& header) {
+        std::lock_guard<std::mutex> lock(global_map_mutex_);
+        
+        if (global_map_ && !global_map_->empty()) {
+            auto map_msg = convert_internal_to_ros(global_map_, "odom");
+            map_msg.header = header;
+            map_msg.header.frame_id = "odom";
+            
+            global_map_pub_->publish(map_msg);
+            RCLCPP_DEBUG(this->get_logger(), "Published global map: %zu points", global_map_->size());
+        }
     }
     
     void publish_map_points(const std_msgs::msg::Header& header) {
@@ -445,10 +597,18 @@ private:
     // Store current frame for feature publishing
     std::shared_ptr<lidar_odometry::database::LidarFrame> current_frame_;
     
+    // Global map accumulation
+    lidar_odometry::util::PointCloudPtr global_map_;
+    //std::shared_ptr<std::unordered_map<lidar_odometry::util::Point3D*, float>> intensity_map_;
+    std::mutex global_map_mutex_;
+    double global_map_voxel_size_;
+    int accumulate_every_n_frames_;
+    
     // ROS components
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr global_map_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr features_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr current_cloud_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr trajectory_pub_;
